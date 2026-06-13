@@ -14,14 +14,11 @@ app = FastAPI(
     title="ADHD Prediction API",
     description=(
         "Predicts ADHD from raw EEG signals using a "
-        "Riemannian geometry + XGBoost pipeline."
+        "Riemannian geometry + XGBoost pipeline, with real EEG metrics."
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
-# ── CORS: allow your frontend to call this API ────────────────────────────────
-# Replace "*" with your actual frontend URL in production, e.g.:
-# allow_origins=["https://your-site.com"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,22 +42,19 @@ def health():
 def predict(data: EEGInput):
     """
     ### Input
-    Raw EEG time-series for one subject:
-    - `eeg_data`: 2-D array of shape **[n_timepoints, 19]**
-    - Values in **µV** (microvolts)
+    - `eeg_data`: 2-D array of shape **[n_timepoints, 19]**, values in µV
     - Minimum **750 samples** (3 seconds at 250 Hz)
     - Channel order: `Fp1 Fp2 F3 F4 C3 C4 P3 P4 O1 O2 F7 F8 T7 T8 P7 P8 Fz Cz Pz`
 
     ### Output
-    - `prediction`: `1` = ADHD, `0` = Non-ADHD
-    - `label`: `"ADHD"` or `"Non-ADHD"`
-    - `confidence`: float 0–1
-    - `confidence_pct`: e.g. `"78.34%"`
-    - `threshold_used`: decision threshold (default 0.45)
+    - `prediction` / `label` / `confidence` / `confidence_pct` / `threshold_used`
+    - `theta_power`, `alpha_power`, `beta_power`, `delta_power`, `gamma_power` (µV²)
+    - `theta_beta_ratio`, `alpha_coherence`, `sample_entropy`
+    - `band_power_distribution`: [delta, theta, alpha, beta, gamma] for charts
+    - `entropy_trend`: per-epoch sample entropy values for trend chart
     """
     try:
-        result = predict_adhd(data)
-        return result
+        return predict_adhd(data)
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:

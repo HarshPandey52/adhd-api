@@ -1,9 +1,0 @@
-services:
-  - type: web
-    name: adhd-prediction-api
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    envVars:
-      - key: PORT
-        value: 8000
-    healthCheckPath: /health
