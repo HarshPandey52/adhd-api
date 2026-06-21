@@ -4,14 +4,20 @@ app/main.py
 FastAPI application entry point.
 
 Endpoints:
-  GET  /                    health check
-  GET  /health               health check
-  POST /predict               ADHD EEG prediction
-  POST /chat                  agentic AI Companion chat (tool-calling enabled)
+  GET  /                       health check
+  GET  /health                 health check
+  POST /predict                ADHD EEG prediction
+  POST /chat                   agentic AI Companion chat (ADK + ArmorIQ enforced)
+  POST /mcp                    the patient-tools MCP server (JSON-RPC/SSE)
   GET  /patients/{id}/history  patient visit history (for direct UI display)
   POST /patients/visit         save a visit record directly (non-chat path)
-  PUT  /patients/visit          update notes/prescription on an existing visit
-  GET  /patients                list all known patient IDs
+  PUT  /patients/visit         update notes/prescription on an existing visit
+  GET  /patients               list all known patient IDs
+
+⚠️ PROTOTYPE: no doctor authentication yet. Tool calls made by the agent
+ARE now verified via ArmorIQ (real SDK, not a placeholder), but the HTTP
+endpoints below them are still open. Add auth before using with real
+patient data.
 """
 
 from fastapi import FastAPI, HTTPException
@@ -20,7 +26,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.schema import EEGInput, ADHDPrediction
 from app.predictor import predict_adhd
 from app.chat_schema import ChatRequest, ChatResponse
-from app.chat_service import get_chat_reply
+from app.armoriq_chat_service import get_chat_reply
+from app.mcp_server import router as mcp_router
 from app.database import (
     init_db, save_visit, get_patient_history,
     update_visit_notes, list_all_patients,
@@ -33,11 +40,11 @@ from app.patient_schema import (
 app = FastAPI(
     title="ADHD Prediction API",
     description=(
-        "EEG-based ADHD screening with real computed metrics, an agentic "
-        "AI Companion (tool-calling chat), and patient visit history. "
-        "⚠️ PROTOTYPE: no authentication — do not use with real patient data."
+        "EEG-based ADHD screening with real computed metrics, a Google ADK "
+        "agent wrapped in ArmorIQ policy enforcement (real SDK), and a "
+        "patient-history MCP server. ⚠️ PROTOTYPE: no doctor auth yet."
     ),
-    version="1.3.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -47,6 +54,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount the MCP server (JSON-RPC/SSE) at /mcp — this is what the ADK agent's
+# McpToolset connects to, and what gets registered in ArmorIQ's MCP Registry.
+app.include_router(mcp_router)
 
 
 @app.on_event("startup")
@@ -77,15 +88,14 @@ def predict(data: EEGInput):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Agentic chat ──────────────────────────────────────────────────────────────
+# ── Agentic chat (ADK + ArmorIQ) ──────────────────────────────────────────────
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(req: ChatRequest):
     """
-    Agentic chat endpoint. The model can autonomously call tools to:
-      - look up a patient's visit history
-      - save the current visit's notes/prescription
-      - list known patients
-    Proxied server-side to Gemini — API key never touches the browser.
+    Runs the NeuroSakhi AI Companion as a real Google ADK agent. Every tool
+    call it makes (get_patient_history, save_visit_record, list_known_patients)
+    is verified by ArmorIQ against a signed intent plan before execution —
+    blocking unplanned/injected tool calls at the proxy level.
     """
     try:
         reply, tools_called = await get_chat_reply(req)
@@ -99,7 +109,6 @@ async def chat(req: ChatRequest):
 # ── Patient history (direct REST path, for UI rendering) ─────────────────────
 @app.get("/patients/{patient_id}/history", response_model=PatientHistoryResponse, tags=["Patients"])
 def get_history(patient_id: str):
-    """Returns all visits for a patient, most recent first."""
     visits = get_patient_history(patient_id)
     return PatientHistoryResponse(
         patient_id=patient_id,
@@ -110,8 +119,6 @@ def get_history(patient_id: str):
 
 @app.post("/patients/visit", response_model=VisitRecord, tags=["Patients"])
 def create_visit(req: SaveVisitRequest):
-    """Saves a new visit record directly (used by the upload-analyze flow,
-    independent of the chat agent)."""
     record = save_visit(
         patient_id=req.patient_id,
         prediction=req.prediction,
@@ -123,7 +130,6 @@ def create_visit(req: SaveVisitRequest):
 
 @app.put("/patients/visit", response_model=VisitRecord, tags=["Patients"])
 def edit_visit(req: UpdateVisitRequest):
-    """Updates notes/prescription on an existing visit record."""
     record = update_visit_notes(req.visit_id, req.doctor_notes, req.prescription)
     if not record:
         raise HTTPException(status_code=404, detail=f"Visit {req.visit_id} not found")
@@ -132,5 +138,4 @@ def edit_visit(req: UpdateVisitRequest):
 
 @app.get("/patients", response_model=PatientListResponse, tags=["Patients"])
 def list_patients():
-    """Returns all patient IDs that have at least one visit on record."""
     return PatientListResponse(patient_ids=list_all_patients())
