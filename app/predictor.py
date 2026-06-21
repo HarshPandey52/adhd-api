@@ -4,10 +4,6 @@ app/predictor.py
 Loads saved pipeline components and runs inference + real EEG metric
 calculations (theta/alpha/beta/delta/gamma power, theta/beta ratio,
 alpha coherence, sample entropy) for display on the frontend.
-
-Preprocessing matches train_and_save_model.py exactly for the
-prediction pipeline. Additional metrics below are computed separately
-on the same epoched data for display purposes.
 """
 
 import os
@@ -21,14 +17,12 @@ from scipy.signal import hilbert
 
 from app.schema import EEGInput, ADHDPrediction
 
-# ── Constants (mirror train_and_save_model.py) ────────────────────────────────
 EEG_CHANNELS = [
     'Fp1','Fp2','F3','F4','C3','C4','P3','P4','O1','O2',
     'F7','F8','T7','T8','P7','P8','Fz','Cz','Pz'
 ]
 SFREQ             = 250
 FREQ_BANDS        = {'theta': (4, 8), 'alpha': (8, 13), 'beta': (13, 30)}
-# Extra bands for display-only metrics (not used by the model)
 DELTA_BAND        = (1, 4)
 GAMMA_BAND        = (30, 45)
 
@@ -39,7 +33,6 @@ OPTIMAL_THRESHOLD = 0.45
 MODEL_DIR         = os.path.join(os.path.dirname(__file__), "..", "model")
 
 
-# ── Load model components once ───────────────────────────────────────────────
 @lru_cache(maxsize=1)
 def _load_components():
     model_path   = os.path.join(MODEL_DIR, "xgb_model.json")
@@ -60,18 +53,8 @@ def _load_components():
     return model, scaler, riemann
 
 
-# ── Feature extraction for prediction (identical to training script) ────────
 def _extract_prediction_features(raw):
-    """
-    raw: MNE RawArray (average-referenced)
-    Returns:
-        X_epochs: [n_epochs, 57, epoch_len]
-        X_power:  [n_epochs, power_feat_dim]
-        theta_power, alpha_power, beta_power: [n_epochs, 19] band power per channel
-        theta_beta_ratio: [n_epochs] frontal ratio
-    """
     frontal_idx = [EEG_CHANNELS.index(ch) for ch in FRONTAL_CHANNELS]
-
     band_epochs_dict, band_power_dict = {}, {}
 
     for band_name, (fmin, fmax) in FREQ_BANDS.items():
@@ -119,9 +102,7 @@ def _extract_prediction_features(raw):
             band_power_dict, theta_beta_ratio, band_epochs_dict['alpha'])
 
 
-# ── Display metrics: delta & gamma power, alpha coherence, sample entropy ────
 def _band_power(raw, fmin, fmax):
-    """Returns [n_epochs, n_channels] mean power for a given band."""
     filtered = raw.copy().filter(fmin, fmax, verbose=False)
     epochs   = mne.make_fixed_length_epochs(
         filtered, duration=EPOCH_DURATION,
@@ -132,12 +113,6 @@ def _band_power(raw, fmin, fmax):
 
 
 def _alpha_coherence(alpha_epochs):
-    """
-    Mean pairwise phase coherence (PLV-style) across all channel pairs,
-    in the alpha band, averaged over epochs.
-    alpha_epochs: [n_epochs, n_channels, n_samples]
-    Returns: float in [0, 1]
-    """
     n_epochs, n_channels, _ = alpha_epochs.shape
     pairs = list(combinations(range(n_channels), 2))
     coh_values = []
@@ -153,10 +128,6 @@ def _alpha_coherence(alpha_epochs):
 
 
 def _sample_entropy(signal, m=2, r=None):
-    """
-    Simple sample entropy implementation for a 1-D signal.
-    m: embedding dimension, r: tolerance (defaults to 0.2 * std)
-    """
     n = len(signal)
     if r is None:
         r = 0.2 * np.std(signal)
@@ -169,7 +140,7 @@ def _sample_entropy(signal, m=2, r=None):
         total = 0
         for i in range(len(templates)):
             dists = np.max(np.abs(templates - templates[i]), axis=1)
-            count += np.sum(dists <= r) - 1  # exclude self-match
+            count += np.sum(dists <= r) - 1
             total += len(templates) - 1
         return count / total if total > 0 else 0.0
 
@@ -182,17 +153,11 @@ def _sample_entropy(signal, m=2, r=None):
 
 
 def _sample_entropy_trend(epochs_data, max_epochs=20, max_samples=300):
-    """
-    Computes a per-epoch sample entropy averaged across channels,
-    downsampled for speed. Returns list of floats for the trend chart.
-    epochs_data: [n_epochs, n_channels, n_samples]  (theta band epochs used as basis)
-    """
     n_epochs = min(epochs_data.shape[0], max_epochs)
     trend = []
 
     for ep in range(n_epochs):
         ch_entropies = []
-        # Use a subset of channels for speed (frontal + central + occipital)
         sample_channels = [0, 1, 4, 5, 8, 9, 16]  # Fp1,Fp2,C3,C4,O1,O2,Fz
         for ch in sample_channels:
             sig = epochs_data[ep, ch, :max_samples]
@@ -202,17 +167,14 @@ def _sample_entropy_trend(epochs_data, max_epochs=20, max_samples=300):
     return trend
 
 
-# ── Main prediction function ──────────────────────────────────────────────────
 def predict_adhd(data: EEGInput) -> ADHDPrediction:
     model, scaler, riemann = _load_components()
 
-    eeg_array = np.array(data.eeg_data)  # [n_timepoints, 19]
+    eeg_array = np.array(data.eeg_data)
 
-    # Validate shape
     if eeg_array.ndim != 2 or eeg_array.shape[1] != len(EEG_CHANNELS):
         raise ValueError(
-            f"eeg_data must have shape [n_timepoints, 19]. "
-            f"Got {eeg_array.shape}"
+            f"eeg_data must have shape [n_timepoints, 19]. Got {eeg_array.shape}"
         )
     min_samples = int(SFREQ * EPOCH_DURATION)
     if eeg_array.shape[0] < min_samples:
@@ -221,13 +183,11 @@ def predict_adhd(data: EEGInput) -> ADHDPrediction:
             f"({EPOCH_DURATION}s × {SFREQ}Hz). Got {eeg_array.shape[0]}."
         )
 
-    # Build MNE Raw object (shared across all feature extraction)
-    data_v = eeg_array.T * 1e-6  # µV → V, shape (19, n_timepoints)
+    data_v = eeg_array.T * 1e-6
     info = mne.create_info(EEG_CHANNELS, SFREQ, ch_types="eeg")
     raw  = mne.io.RawArray(data_v, info, verbose=False)
     raw.set_eeg_reference("average", verbose=False)
 
-    # ── Prediction features (identical to training pipeline) ───────────────
     X_epochs, X_power, band_power_dict, theta_beta_ratio, alpha_epochs = \
         _extract_prediction_features(raw)
 
@@ -241,34 +201,24 @@ def predict_adhd(data: EEGInput) -> ADHDPrediction:
     prediction = 1 if mean_prob >= OPTIMAL_THRESHOLD else 0
     label      = "ADHD" if prediction == 1 else "Non-ADHD"
 
-    # ── Real display metrics ─────────────────────────────────────────────────
-    # Mean power across all epochs & channels for theta/alpha/beta
-    theta_power = float(np.mean(band_power_dict['theta']) * 1e12)  # V² → µV²
+    theta_power = float(np.mean(band_power_dict['theta']) * 1e12)
     alpha_power = float(np.mean(band_power_dict['alpha']) * 1e12)
     beta_power  = float(np.mean(band_power_dict['beta'])  * 1e12)
 
-    # Delta & gamma (computed separately, display-only)
     delta_power_arr = _band_power(raw, *DELTA_BAND)
     gamma_power_arr = _band_power(raw, *GAMMA_BAND)
     delta_power = float(np.mean(delta_power_arr) * 1e12)
     gamma_power = float(np.mean(gamma_power_arr) * 1e12)
 
-    # Frontal theta/beta ratio (mean across epochs)
     tb_ratio = float(np.mean(theta_beta_ratio))
-
-    # Alpha coherence (PLV across channel pairs, alpha band)
     alpha_coh = _alpha_coherence(alpha_epochs)
 
-    # Sample entropy: overall mean + per-epoch trend (using theta epochs as basis)
     entropy_trend = _sample_entropy_trend(alpha_epochs)
     sample_ent = float(np.mean(entropy_trend)) if entropy_trend else 0.0
 
     band_power_distribution = [
-        round(delta_power, 4),
-        round(theta_power, 4),
-        round(alpha_power, 4),
-        round(beta_power, 4),
-        round(gamma_power, 4),
+        round(delta_power, 4), round(theta_power, 4), round(alpha_power, 4),
+        round(beta_power, 4), round(gamma_power, 4),
     ]
 
     return ADHDPrediction(
@@ -277,17 +227,14 @@ def predict_adhd(data: EEGInput) -> ADHDPrediction:
         confidence       = round(mean_prob, 4),
         confidence_pct   = f"{round(mean_prob * 100, 2)}%",
         threshold_used   = OPTIMAL_THRESHOLD,
-
         theta_power      = round(theta_power, 4),
         alpha_power      = round(alpha_power, 4),
         beta_power       = round(beta_power, 4),
         delta_power      = round(delta_power, 4),
         gamma_power      = round(gamma_power, 4),
-
         theta_beta_ratio = round(tb_ratio, 4),
         alpha_coherence  = round(alpha_coh, 4),
         sample_entropy   = round(sample_ent, 4),
-
         band_power_distribution = band_power_distribution,
         entropy_trend            = entropy_trend,
     )

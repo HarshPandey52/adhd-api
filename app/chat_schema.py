@@ -21,10 +21,13 @@ class ChatRequest(BaseModel):
     )
     eeg_context: Optional[dict] = Field(
         default=None,
-        description="Optional dict of the latest prediction result "
-                     "(label, confidence, theta_power, etc.) for grounding."
+        description="Optional dict of the latest prediction result for grounding."
     )
 
 
 class ChatResponse(BaseModel):
     reply: str = Field(..., description="The assistant's reply text")
+    tool_calls_made: List[str] = Field(
+        default_factory=list,
+        description="Names of tools the agent invoked while answering, for transparency/debugging"
+    )
