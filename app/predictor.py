@@ -4,9 +4,21 @@ app/predictor.py
 Loads saved pipeline components and runs inference + real EEG metric
 calculations (theta/alpha/beta/delta/gamma power, theta/beta ratio,
 alpha coherence, sample entropy) for display on the frontend.
+
+PERFORMANCE NOTES (added after diagnosing slow/hanging /predict on Render
+free tier):
+  - Epoch count is now capped (MAX_EPOCHS_FOR_INFERENCE) before any of the
+    expensive per-epoch work (Riemannian transform, coherence, entropy)
+    runs. Previously _alpha_coherence in particular ran over EVERY epoch
+    in the uploaded recording with no limit, which does not scale.
+  - _sample_entropy is now vectorized with scipy.spatial.distance.cdist
+    instead of a Python-level double loop over template pairs.
+  - Every stage is timed and printed, so Render logs show exactly where
+    time is going on the next real request instead of just going quiet.
 """
 
 import os
+import time
 import numpy as np
 import mne
 import joblib
@@ -14,6 +26,7 @@ from xgboost import XGBClassifier
 from functools import lru_cache
 from itertools import combinations
 from scipy.signal import hilbert
+from scipy.spatial.distance import cdist
 
 from app.schema import EEGInput, ADHDPrediction
 
@@ -31,6 +44,17 @@ EPOCH_DURATION    = 3.0
 EPOCH_OVERLAP     = 1.5
 OPTIMAL_THRESHOLD = 0.45
 MODEL_DIR         = os.path.join(os.path.dirname(__file__), "..", "model")
+
+# Hard cap on how many epochs get run through the expensive per-epoch
+# stages (Riemannian transform, coherence, entropy). Mirrors
+# MAX_EPOCHS_PER_SUBJECT from the training notebook — training never saw
+# more than this many epochs per subject either, so capping here doesn't
+# take the model outside its training distribution.
+MAX_EPOCHS_FOR_INFERENCE = 15
+
+
+def _log(stage: str, t0: float):
+    print(f"[predict timing] {stage}: {time.time() - t0:.2f}s", flush=True)
 
 
 @lru_cache(maxsize=1)
@@ -53,11 +77,22 @@ def _load_components():
     return model, scaler, riemann
 
 
+def _select_epoch_indices(n_epochs: int, max_epochs: int) -> np.ndarray:
+    """Evenly-spaced subset of epoch indices, capped at max_epochs.
+    Deterministic (unlike the training notebook's random subsample) since
+    inference should return the same result for the same upload."""
+    if n_epochs <= max_epochs:
+        return np.arange(n_epochs)
+    return np.linspace(0, n_epochs - 1, max_epochs).round().astype(int)
+
+
 def _extract_prediction_features(raw):
+    t0 = time.time()
     frontal_idx = [EEG_CHANNELS.index(ch) for ch in FRONTAL_CHANNELS]
     band_epochs_dict, band_power_dict = {}, {}
 
     for band_name, (fmin, fmax) in FREQ_BANDS.items():
+        tb = time.time()
         filtered = raw.copy().filter(fmin, fmax, verbose=False)
         epochs   = mne.make_fixed_length_epochs(
             filtered, duration=EPOCH_DURATION,
@@ -66,6 +101,15 @@ def _extract_prediction_features(raw):
         ep_data = epochs.get_data()
         band_epochs_dict[band_name] = ep_data
         band_power_dict[band_name]  = np.mean(ep_data**2, axis=2)
+        _log(f"filter+epoch band={band_name}", tb)
+
+    # Cap epoch count ONCE here, consistently across bands, before any of
+    # the expensive per-epoch work below runs.
+    n_epochs = min(band_epochs_dict[b].shape[0] for b in FREQ_BANDS)
+    keep = _select_epoch_indices(n_epochs, MAX_EPOCHS_FOR_INFERENCE)
+    for b in FREQ_BANDS:
+        band_epochs_dict[b] = band_epochs_dict[b][keep]
+        band_power_dict[b]  = band_power_dict[b][keep]
 
     stacked = np.concatenate(
         [band_epochs_dict['theta'],
@@ -98,21 +142,32 @@ def _extract_prediction_features(raw):
         ])
         X_power_list.append(power_feat)
 
+    _log(f"_extract_prediction_features total (kept {len(keep)}/{n_epochs} epochs)", t0)
+
     return (np.array(X_epochs_list), np.array(X_power_list),
             band_power_dict, theta_beta_ratio, band_epochs_dict['alpha'])
 
 
 def _band_power(raw, fmin, fmax):
+    t0 = time.time()
     filtered = raw.copy().filter(fmin, fmax, verbose=False)
     epochs   = mne.make_fixed_length_epochs(
         filtered, duration=EPOCH_DURATION,
         overlap=EPOCH_OVERLAP, preload=True, verbose=False
     )
     ep_data = epochs.get_data()
-    return np.mean(ep_data**2, axis=2)
+    # Same cap as the main feature path, so a huge upload doesn't blow this
+    # stage up either — it's only used for a mean anyway.
+    keep = _select_epoch_indices(ep_data.shape[0], MAX_EPOCHS_FOR_INFERENCE)
+    _log(f"_band_power({fmin}-{fmax}Hz)", t0)
+    return np.mean(ep_data[keep]**2, axis=2)
 
 
 def _alpha_coherence(alpha_epochs):
+    """alpha_epochs is already capped to MAX_EPOCHS_FOR_INFERENCE by the
+    caller — this used to run over every epoch in the upload with no
+    limit, which was the main unbounded cost for long recordings."""
+    t0 = time.time()
     n_epochs, n_channels, _ = alpha_epochs.shape
     pairs = list(combinations(range(n_channels), 2))
     coh_values = []
@@ -124,10 +179,14 @@ def _alpha_coherence(alpha_epochs):
             plv = np.abs(np.mean(np.exp(1j * phase_diff)))
             coh_values.append(plv)
 
+    _log(f"_alpha_coherence ({n_epochs} epochs)", t0)
     return float(np.mean(coh_values)) if coh_values else 0.0
 
 
 def _sample_entropy(signal, m=2, r=None):
+    """Vectorized sample entropy. Replaces the old per-template Python
+    loop with scipy's cdist (Chebyshev = max absolute difference, which
+    is exactly the distance metric sample entropy uses)."""
     n = len(signal)
     if r is None:
         r = 0.2 * np.std(signal)
@@ -135,13 +194,14 @@ def _sample_entropy(signal, m=2, r=None):
         return 0.0
 
     def _phi(m_):
-        templates = np.array([signal[i:i + m_] for i in range(n - m_)])
-        count = 0
-        total = 0
-        for i in range(len(templates)):
-            dists = np.max(np.abs(templates - templates[i]), axis=1)
-            count += np.sum(dists <= r) - 1
-            total += len(templates) - 1
+        n_templates = n - m_
+        if n_templates < 2:
+            return 0.0
+        templates = np.array([signal[i:i + m_] for i in range(n_templates)])
+        dists = cdist(templates, templates, metric='chebyshev')
+        # exclude self-matches (diagonal) from both count and total
+        count = np.sum(dists <= r) - n_templates
+        total = n_templates * (n_templates - 1)
         return count / total if total > 0 else 0.0
 
     phi_m  = _phi(m)
@@ -153,6 +213,7 @@ def _sample_entropy(signal, m=2, r=None):
 
 
 def _sample_entropy_trend(epochs_data, max_epochs=20, max_samples=300):
+    t0 = time.time()
     n_epochs = min(epochs_data.shape[0], max_epochs)
     trend = []
 
@@ -164,10 +225,12 @@ def _sample_entropy_trend(epochs_data, max_epochs=20, max_samples=300):
             ch_entropies.append(_sample_entropy(sig))
         trend.append(round(float(np.mean(ch_entropies)), 4))
 
+    _log(f"_sample_entropy_trend ({n_epochs} epochs)", t0)
     return trend
 
 
 def predict_adhd(data: EEGInput) -> ADHDPrediction:
+    request_t0 = time.time()
     model, scaler, riemann = _load_components()
 
     eeg_array = np.array(data.eeg_data)
@@ -183,20 +246,26 @@ def predict_adhd(data: EEGInput) -> ADHDPrediction:
             f"({EPOCH_DURATION}s × {SFREQ}Hz). Got {eeg_array.shape[0]}."
         )
 
+    t0 = time.time()
     data_v = eeg_array.T * 1e-6
     info = mne.create_info(EEG_CHANNELS, SFREQ, ch_types="eeg")
     raw  = mne.io.RawArray(data_v, info, verbose=False)
     raw.set_eeg_reference("average", verbose=False)
+    _log("build RawArray + reference", t0)
 
     X_epochs, X_power, band_power_dict, theta_beta_ratio, alpha_epochs = \
         _extract_prediction_features(raw)
 
+    t0 = time.time()
     X_riemann  = riemann.transform(X_epochs)
     X_combined = np.hstack([X_riemann, X_power])
     X_scaled   = scaler.transform(X_combined)
+    _log(f"riemann.transform + scale ({X_epochs.shape[0]} epochs)", t0)
 
+    t0 = time.time()
     epoch_probs = model.predict_proba(X_scaled)[:, 1]
     mean_prob   = float(np.median(epoch_probs))
+    _log("model.predict_proba", t0)
 
     prediction = 1 if mean_prob >= OPTIMAL_THRESHOLD else 0
     label      = "ADHD" if prediction == 1 else "Non-ADHD"
@@ -220,6 +289,8 @@ def predict_adhd(data: EEGInput) -> ADHDPrediction:
         round(delta_power, 4), round(theta_power, 4), round(alpha_power, 4),
         round(beta_power, 4), round(gamma_power, 4),
     ]
+
+    _log("TOTAL /predict", request_t0)
 
     return ADHDPrediction(
         prediction       = prediction,
