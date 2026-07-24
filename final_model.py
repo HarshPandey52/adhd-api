@@ -1,12 +1,50 @@
+"""
+final_model.py
+==============
+Trains the New32 (32-channel) ADHD screening model and saves deployment
+artifacts: riemann_pipeline.pkl, scaler.pkl, xgb_model.json.
+
+⚠️ PLACEMENT REQUIREMENT — READ BEFORE RUNNING:
+This script now imports RiemannTangentSpace and related functions from
+app/riemann_utils.py instead of defining them inline. That matters
+because joblib pickles a *reference* to where a class lives (its module
+import path), not the class's code. If this script is run in a folder
+where `app` isn't importable, joblib will pickle a reference to
+whatever module IS running it (e.g. `__main__`), and predictor.py in
+the deployed API will fail with:
+    "Can't get attribute 'RiemannTangentSpace' on <module '__main__'>"
+
+To avoid that:
+  1. Place this file at the ROOT of your adhd-api repo, directly
+     alongside the `app/` folder, e.g.:
+         adhd-api/
+           app/
+             __init__.py
+             riemann_utils.py   <- must already exist here
+             predictor.py
+             ...
+           final_model.py       <- this file goes here
+  2. Run it from that same folder:
+         cd path/to/adhd-api
+         python final_model.py
+     (Running it from anywhere else, or moving app/riemann_utils.py
+     elsewhere, will break the import path and re-break the pickle.)
+
+After training completes, copy the three output files into your repo's
+model/ folder, commit, and push:
+    riemann_pipeline.pkl
+    scaler.pkl
+    xgb_model.json
+"""
+
 import gc
 import glob
+import json
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy import signal
-from sklearn.covariance import OAS
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -18,10 +56,18 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
+from app.riemann_utils import (
+    resample_signal,
+    bandpass_filter,
+    make_fixed_length_epochs,
+    epoch_covariance,
+    RiemannTangentSpace,
+)
+
 # ===============================
 # CONFIG
 # ===============================
-DATA_DIR = "D:\Out"   # <-- set to your real path (see os.walk snippet)
+DATA_DIR = r"D:\Out"   # <-- set to your real path (32-channel training CSVs)
 FILE_PATTERN = "sub-*.csv"                     # excludes manifest.csv
 
 SFREQ = 500                             # native TDBRAIN sampling rate
@@ -62,133 +108,6 @@ AGG_PERCENTILE = 75                     # subject-level score = this percentile 
                                          # a cluster of high-prob epochs to flag, not a majority.
 
 RNG = np.random.default_rng(RANDOM_STATE)
-
-
-# ===============================
-# SIGNAL PROCESSING (replaces mne)
-# ===============================
-def resample_signal(data, orig_sfreq, target_sfreq):
-    """data: (n_channels, n_times) -> resampled to target_sfreq using
-    polyphase filtering (scipy.signal.resample_poly), which is fast and
-    avoids aliasing. 500 -> 125 Hz reduces to up=1, down=4 exactly."""
-    from math import gcd
-    g = gcd(int(orig_sfreq), int(target_sfreq))
-    up, down = int(target_sfreq) // g, int(orig_sfreq) // g
-    return signal.resample_poly(data, up, down, axis=1).astype(np.float32)
-
-
-def bandpass_filter(data, sfreq, fmin, fmax, order=4):
-    """data: (n_channels, n_times) float32 -> filtered float32."""
-    nyq = sfreq / 2.0
-    sos = signal.butter(order, [fmin / nyq, fmax / nyq], btype="band", output="sos")
-    return signal.sosfiltfilt(sos, data, axis=1).astype(np.float32)
-
-
-def make_fixed_length_epochs(data, sfreq, duration, overlap):
-    """data: (n_channels, n_times) -> (n_epochs, n_channels, win_samples)."""
-    n_channels, n_times = data.shape
-    win = int(round(duration * sfreq))
-    step = win - int(round(overlap * sfreq))
-    if step <= 0:
-        raise ValueError("overlap must be smaller than duration")
-    starts = range(0, n_times - win + 1, step)
-    epochs = np.stack([data[:, s:s + win] for s in starts], axis=0)
-    return epochs
-
-
-# ===============================
-# RIEMANNIAN GEOMETRY (replaces pyriemann)
-# ===============================
-def _eig_sym(M):
-    eigvals, eigvecs = np.linalg.eigh(M)
-    eigvals = np.clip(eigvals, 1e-10, None)
-    return eigvals, eigvecs
-
-
-def sqrtm_sym(M):
-    w, v = _eig_sym(M)
-    return (v @ np.diag(np.sqrt(w)) @ v.T).astype(np.float32)
-
-
-def invsqrtm_sym(M):
-    w, v = _eig_sym(M)
-    return (v @ np.diag(1.0 / np.sqrt(w)) @ v.T).astype(np.float32)
-
-
-def logm_sym(M):
-    w, v = _eig_sym(M)
-    return (v @ np.diag(np.log(w)) @ v.T).astype(np.float32)
-
-
-def expm_sym(M):
-    w, v = np.linalg.eigh(M)
-    return (v @ np.diag(np.exp(w)) @ v.T).astype(np.float32)
-
-
-def epoch_covariance(epoch):
-    """epoch: (n_channels, n_times) float32 -> (n_channels, n_channels) float32
-    OAS-shrunk covariance. Equivalent to pyriemann Covariances(estimator='oas')."""
-    est = OAS(assume_centered=False)
-    est.fit(epoch.T.astype(np.float64))  # sklearn's OAS wants float64 internally
-    return est.covariance_.astype(np.float32)
-
-
-def riemannian_mean(covs, max_iter=25, tol=1e-6):
-    """Karcher/Frechet mean of a set of SPD matrices (affine-invariant metric)."""
-    C = np.mean(covs, axis=0).astype(np.float32)
-    for _ in range(max_iter):
-        C_sqrt = sqrtm_sym(C)
-        C_invsqrt = invsqrtm_sym(C)
-        S = np.zeros_like(C)
-        for cov in covs:
-            S += logm_sym(C_invsqrt @ cov @ C_invsqrt)
-        S /= len(covs)
-        C_new = (C_sqrt @ expm_sym(S) @ C_sqrt).astype(np.float32)
-        crit = np.linalg.norm(C_new - C, ord="fro")
-        C = C_new
-        if crit < tol:
-            break
-    return C
-
-
-def tangent_space_vector(cov, mean_invsqrt):
-    """Project one SPD covariance into the tangent space and vectorize
-    (upper triangle, off-diagonals scaled by sqrt(2))."""
-    S = logm_sym(mean_invsqrt @ cov @ mean_invsqrt)
-    n = S.shape[0]
-    coeffs = np.full((n, n), np.sqrt(2), dtype=np.float32)
-    np.fill_diagonal(coeffs, 1.0)
-    iu = np.triu_indices(n)
-    return (S * coeffs)[iu]
-
-
-class RiemannTangentSpace:
-    """Fit the Frechet mean from a subsample of covariances (fast), then
-    project the FULL set of covariances into tangent space (one pass, no
-    iteration needed for that part)."""
-
-    def __init__(self, subsample_size=MEAN_SUBSAMPLE_SIZE):
-        self.subsample_size = subsample_size
-        self.mean_ = None
-        self.mean_invsqrt_ = None
-
-    def fit(self, covs):
-        if len(covs) > self.subsample_size:
-            idx = RNG.choice(len(covs), size=self.subsample_size, replace=False)
-            sample = [covs[i] for i in idx]
-        else:
-            sample = covs
-        self.mean_ = riemannian_mean(sample)
-        self.mean_invsqrt_ = invsqrtm_sym(self.mean_)
-        return self
-
-    def transform(self, covs):
-        return np.stack([tangent_space_vector(c, self.mean_invsqrt_) for c in covs])
-
-    def fit_transform(self, covs):
-        self.fit(covs)
-        return self.transform(covs)
-
 
 
 # ===============================
@@ -293,7 +212,6 @@ def extract_subject_features(path, label, subject_id):
     return cov_subj, power_subj, y_subj, g_subj
 
 
-
 def build_dataset(subject_index, log_every=50):
     X_cov, X_power, y_all, groups = [], [], [], []
     for i, (_, row) in enumerate(subject_index.iterrows()):
@@ -310,6 +228,7 @@ def build_dataset(subject_index, log_every=50):
                   f"{len(X_cov)} epochs so far")
 
     return X_cov, np.array(X_power, dtype=np.float32), np.array(y_all), np.array(groups)
+
 
 # ===============================
 # STEP 3 — THRESHOLD TUNING (train-only)
@@ -358,7 +277,6 @@ def tune_threshold(model, X_val, y_val, groups_val, metric="balanced_accuracy"):
     return best_t
 
 
-
 # ===============================
 # MAIN
 # ===============================
@@ -389,7 +307,7 @@ def main():
           f"test: {len(np.unique(groups[test_idx]))}")
 
     # ---- Riemannian tangent space (mean estimated on FIT only, subsampled) ----
-    riemann = RiemannTangentSpace()
+    riemann = RiemannTangentSpace(subsample_size=MEAN_SUBSAMPLE_SIZE)
     X_fit_r = riemann.fit_transform(X_cov[fit_idx])
     X_val_r = riemann.transform(X_cov[val_idx])
     X_test_r = riemann.transform(X_cov[test_idx])
@@ -478,6 +396,30 @@ def main():
     joblib.dump(scaler, "scaler.pkl")
     model.get_booster().save_model("xgb_model.json")
     print("\nSaved riemann_pipeline.pkl, scaler.pkl, xgb_model.json")
+
+    # Also save the tuned threshold + aggregation percentile so you don't have
+    # to copy-paste them out of console output into predictor.py by hand.
+    # predictor.py's OPTIMAL_THRESHOLD / AGG_PERCENTILE constants should match
+    # these values exactly.
+    config = {
+        "optimal_threshold": round(float(threshold), 4),
+        "agg_percentile": AGG_PERCENTILE,
+        "test_accuracy": round(float(acc), 4),
+        "test_auc": round(float(auc), 4),
+        "test_sensitivity": round(float(sens), 4),
+        "test_specificity": round(float(spec), 4),
+        "n_channels": len(EEG_CHANNELS),
+        "sfreq_native": SFREQ,
+        "sfreq_process": PROCESS_SFREQ,
+        "epoch_duration_s": EPOCH_DURATION,
+        "epoch_overlap_s": EPOCH_OVERLAP,
+        "max_epochs_per_subject": MAX_EPOCHS_PER_SUBJECT,
+    }
+    with open("model_config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    print("Saved model_config.json — copy optimal_threshold into "
+          "predictor.py's OPTIMAL_THRESHOLD constant before deploying.")
+
 
 if __name__ == "__main__":
     main()

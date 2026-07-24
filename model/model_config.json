@@ -1,0 +1,14 @@
+{
+  "optimal_threshold": 0.7,
+  "agg_percentile": 75,
+  "test_accuracy": 0.8714,
+  "test_auc": 0.7465,
+  "test_sensitivity": 0.375,
+  "test_specificity": 0.9355,
+  "n_channels": 32,
+  "sfreq_native": 500,
+  "sfreq_process": 125,
+  "epoch_duration_s": 3.0,
+  "epoch_overlap_s": 0.0,
+  "max_epochs_per_subject": 15
+}
